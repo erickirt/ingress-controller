@@ -14,6 +14,7 @@ import (
 	"github.com/gosimple/slug"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
+	"google.golang.org/protobuf/types/known/structpb"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/pomerium/ingress-controller/model"
 	"github.com/pomerium/ingress-controller/pomerium/gateway"
+	"github.com/pomerium/ingress-controller/util"
 )
 
 // NewAPIReconciler initializes a reconciler that syncs using the unified API,
@@ -83,7 +85,7 @@ func (r *APIReconciler) Upsert(ctx context.Context, ic *model.IngressConfig) (bo
 			tlsSecrets = append(tlsSecrets, s)
 		}
 	}
-	changed, err := r.upsertKeyPairs(ctx, tlsSecrets)
+	changed, err := r.syncSecrets(ctx, tlsSecrets)
 	if err != nil {
 		return anyChanges, err
 	}
@@ -120,7 +122,7 @@ func (r *APIReconciler) Set(ctx context.Context, ics []*model.IngressConfig) (bo
 		}
 	}
 
-	anyChanges, err := r.upsertKeyPairs(ctx, slices.Collect(maps.Values(tlsSecrets)))
+	anyChanges, err := r.syncSecrets(ctx, slices.Collect(maps.Values(tlsSecrets)))
 	if err != nil {
 		return anyChanges, err
 	}
@@ -140,39 +142,36 @@ func (r *APIReconciler) Set(ctx context.Context, ics []*model.IngressConfig) (bo
 	return anyChanges, errors.Join(errs...)
 }
 
-func (r *APIReconciler) upsertOneIngress(ctx context.Context, ic *model.IngressConfig) (bool, error) {
-	logger := log.FromContext(ctx).WithName("APIReconciler.upsertOneIngress")
-
+func (r *APIReconciler) upsertOneIngress(
+	ctx context.Context, ic *model.IngressConfig,
+) (changed bool, err error) {
 	routes, err := ingressToRoutes(ctx, ic)
 	if err != nil {
 		return false, fmt.Errorf("couldn't convert ingress to routes: %w", err)
 	}
 
-	var anyChanges bool
-
 	originalIngress := ic.Ingress.DeepCopy()
 	defer func() {
-		if !anyChanges {
+		if !changed {
 			return
 		}
-		err := r.k8sClient.Patch(ctx, ic.Ingress, client.MergeFrom(originalIngress))
-		if err != nil {
-			logger.Error(err, "couldn't patch ingress", "ingress", ic.Name)
-		}
+		// Merge any error from Patch() with the named return parameter 'err' to
+		// ensure that it will propagate to the caller.
+		err = errors.Join(err, r.k8sClient.Patch(ctx, ic.Ingress, client.MergeFrom(originalIngress)))
 	}()
 
-	anyChanges = anyChanges || controllerutil.AddFinalizer(ic.Ingress, apiFinalizer)
+	changed = changed || controllerutil.AddFinalizer(ic.Ingress, apiFinalizer)
 
 	kv, err := removeKeyPrefix(ic.Ingress.Annotations, ic.AnnotationPrefix)
 	if err != nil {
-		return anyChanges, err
+		return changed, err
 	}
 
-	changed, updatedPolicyID, err := r.syncIngressPolicy(ctx, ic.Ingress, kv)
+	changedPolicy, updatedPolicyID, err := r.syncIngressPolicy(ctx, ic.Ingress, kv)
 	if err != nil {
-		return anyChanges, err
+		return changed, err
 	}
-	anyChanges = anyChanges || changed
+	changed = changed || changedPolicy
 
 	var policyIDs []string
 	if updatedPolicyID != "" {
@@ -205,7 +204,7 @@ func (r *APIReconciler) upsertOneIngress(ctx context.Context, ic *model.IngressC
 	tlsClientKeyPairID := keyPairIDForAnnotation(model.TLSClientSecret)
 	tlsDownstreamClientCAKeyPairID := keyPairIDForAnnotation(model.TLSDownstreamClientCASecret)
 	if len(keypairErrs) > 0 {
-		return anyChanges, errors.Join(keypairErrs...)
+		return changed, errors.Join(keypairErrs...)
 	}
 
 	unusedRouteIDAnnotations := allRouteIDAnnotations(ic.Annotations)
@@ -213,6 +212,7 @@ func (r *APIReconciler) upsertOneIngress(ctx context.Context, ic *model.IngressC
 	for i, route := range routes {
 		k := routeIDAnnotationForIndex(i)
 		delete(unusedRouteIDAnnotations, k)
+		route.Id = emptyToNil(ic.Annotations[k])
 
 		// Swap out any inline policies for the policy ID reference, and swap
 		// out any TLS secrets for keypair ID references.
@@ -229,14 +229,14 @@ func (r *APIReconciler) upsertOneIngress(ctx context.Context, ic *model.IngressC
 		// Clear the route StatName as it can't currently be set in Pomerium Zero.
 		route.StatName = nil
 
-		changed, err := r.upsertOneRoute(ctx, ic.Annotations[k], route)
+		changedRoute, err := r.upsertOneRoute(ctx, route)
 		if err != nil {
-			return anyChanges, err
+			return changed, err
 		}
-		if ic.Annotations[k] == "" {
+		if ic.Annotations[k] != *route.Id {
 			setAnnotation(ic, k, *route.Id)
 		}
-		anyChanges = anyChanges || changed
+		changed = changed || changedRoute
 	}
 
 	// If the Ingress object has any other route ID annotations, these indicate
@@ -244,9 +244,9 @@ func (r *APIReconciler) upsertOneIngress(ctx context.Context, ic *model.IngressC
 	// the case when an existing Rule is deleted from an Ingress.)
 	anyDeletes, err := r.deleteRoutes(ctx, ic.Ingress, unusedRouteIDAnnotations)
 	if err != nil {
-		return anyChanges, err
+		return changed, err
 	}
-	anyChanges = anyChanges || anyDeletes
+	changed = changed || anyDeletes
 
 	// If there was a linked policy that is no no longer needed, delete it.
 	// (This cannot be done until all of the linked routes are updated to no
@@ -254,21 +254,21 @@ func (r *APIReconciler) upsertOneIngress(ctx context.Context, ic *model.IngressC
 	if ic.Annotations[apiPolicyIDAnnotation] != "" && updatedPolicyID == "" {
 		deleted, err := r.deletePolicy(ctx, ic.Ingress)
 		if err != nil {
-			return anyChanges, err
+			return changed, err
 		}
-		anyChanges = anyChanges || deleted
+		changed = changed || deleted
 	}
 
-	return anyChanges, nil
+	return changed, nil
 }
 
-func (r *APIReconciler) upsertKeyPairs(
+func (r *APIReconciler) syncSecrets(
 	ctx context.Context,
 	secrets []*corev1.Secret,
 ) (bool, error) {
 	var anyChanges bool
 	for _, secret := range secrets {
-		changed, err := r.upsertOneKeyPair(ctx, secret)
+		changed, err := r.syncOneSecret(ctx, secret)
 		if err != nil {
 			return anyChanges, err
 		}
@@ -277,45 +277,40 @@ func (r *APIReconciler) upsertKeyPairs(
 	return anyChanges, nil
 }
 
-func (r *APIReconciler) upsertOneKeyPair(
+func keyPairName(n types.NamespacedName) string {
+	return slug.Make(fmt.Sprintf("%s %s", n.Namespace, n.Name))
+}
+
+func (r *APIReconciler) syncOneSecret(
 	ctx context.Context,
 	secret *corev1.Secret,
 ) (bool, error) {
-	logger := log.FromContext(ctx).WithName("APIReconciler.upsertOneKeyPair")
-
 	cert, hasTLSCert := secret.Data[corev1.TLSCertKey]
 	if !hasTLSCert {
 		cert = secret.Data[model.CAKey]
 	}
 
-	name := slug.Make(fmt.Sprintf("%s %s", secret.Namespace, secret.Name))
+	name := keyPairName(util.GetNamespacedName(secret))
 	keyPair := &pomerium.KeyPair{
 		Name:         &name,
 		Certificate:  cert,
 		Key:          secret.Data[corev1.TLSPrivateKeyKey],
 		OriginatorId: &originatorID,
 	}
-
-	existingKeyPairID := secret.Annotations[apiKeyPairIDAnnotation]
-	if existingKeyPairID == "" {
-		// No linked keypair, so we need to create one.
-		updatedKeyPairID, err := r.createKeyPair(ctx, keyPair)
-		if err != nil {
-			return false, fmt.Errorf("couldn't create key pair: %w", err)
-		}
-
-		originalSecret := secret.DeepCopy()
-		setAnnotation(secret, apiKeyPairIDAnnotation, updatedKeyPairID)
-		controllerutil.AddFinalizer(secret, apiFinalizer)
-		err = r.k8sClient.Patch(ctx, secret, client.MergeFrom(originalSecret))
-		if err != nil {
-			logger.Error(err, "couldn't patch secret", "name", secret.Name)
-		}
-		return true, err
+	if id := secret.Annotations[apiKeyPairIDAnnotation]; id != "" {
+		keyPair.Id = &id
 	}
 
-	keyPair.Id = &existingKeyPairID
-	return r.upsertKeyPair(ctx, keyPair)
+	originalSecret := secret.DeepCopy()
+	changed, err := r.upsertKeyPair(ctx, keyPair)
+	if err != nil {
+		return false, err
+	} else if changed {
+		setAnnotation(secret, apiKeyPairIDAnnotation, keyPair.GetId())
+		controllerutil.AddFinalizer(secret, apiFinalizer)
+		err = r.k8sClient.Patch(ctx, secret, client.MergeFrom(originalSecret))
+	}
+	return changed, err
 }
 
 // SetConfig updates just the shared config settings
@@ -332,7 +327,7 @@ func (r *APIReconciler) SetConfig(ctx context.Context, cfg *model.Config) (chang
 	allCertSecrets := make([]*corev1.Secret, 0, len(cfg.CASecrets)+len(cfg.Certs))
 	allCertSecrets = append(allCertSecrets, cfg.CASecrets...)
 	allCertSecrets = append(allCertSecrets, slices.Collect(maps.Values(cfg.Certs))...)
-	changedKeyPair, err := r.upsertKeyPairs(ctx, allCertSecrets)
+	changedKeyPair, err := r.syncSecrets(ctx, allCertSecrets)
 	if err != nil {
 		return changes, err
 	}
@@ -388,9 +383,9 @@ func (r *APIReconciler) SetConfig(ctx context.Context, cfg *model.Config) (chang
 }
 
 // Delete removes pomerium routes corresponding to this ingress.
-func (r *APIReconciler) Delete(ctx context.Context, name types.NamespacedName) (bool, error) {
+func (r *APIReconciler) Delete(ctx context.Context, name types.NamespacedName) (changed bool, err error) {
 	ingress := new(networkingv1.Ingress)
-	err := r.k8sClient.Get(ctx, name, ingress)
+	err = r.k8sClient.Get(ctx, name, ingress)
 	if apierrors.IsNotFound(err) {
 		return false, nil
 	} else if err != nil {
@@ -399,39 +394,41 @@ func (r *APIReconciler) Delete(ctx context.Context, name types.NamespacedName) (
 
 	originalIngress := ingress.DeepCopy()
 	defer func() {
-		err := r.k8sClient.Patch(ctx, ingress, client.MergeFrom(originalIngress))
-		if err != nil {
-			logger := log.FromContext(ctx).WithName("APIReconciler.Delete")
-			logger.Error(err, "couldn't patch ingress", "name", ingress.Name)
+		if !changed {
+			return
 		}
+		// Merge any error from Patch() with the named return parameter 'err' to
+		// ensure that it will propagate to the caller.
+		err = errors.Join(err, r.k8sClient.Patch(ctx, ingress, client.MergeFrom(originalIngress)))
 	}()
 
 	routeAnnotations := allRouteIDAnnotations(ingress.Annotations)
-	anyDeletes, err := r.deleteRoutes(ctx, ingress, routeAnnotations)
+	anyRouteDeleted, err := r.deleteRoutes(ctx, ingress, routeAnnotations)
+	changed = changed || anyRouteDeleted
 	if err != nil {
-		return anyDeletes, err
+		return changed, err
 	}
 
 	policyDeleted, err := r.deletePolicy(ctx, ingress)
 	if err != nil {
-		return anyDeletes, err
+		return changed, err
 	}
-	anyDeletes = anyDeletes || policyDeleted
+	changed = changed || policyDeleted
 
 	// Remove keypairs corresponding to any newly-unreferenced TLS secrets.
 	unreferencedSecrets := r.secretsMap.RemoveEntity(model.Key{
 		Kind:           ingress.Kind,
 		NamespacedName: name,
 	})
-	anyKeyPairDeletes, err := r.deleteKeyPairs(ctx, unreferencedSecrets...)
+	anyKeyPairDeleted, err := r.deleteKeyPairs(ctx, unreferencedSecrets...)
 	if err != nil {
-		return anyDeletes, err
+		return changed, err
 	}
-	anyDeletes = anyDeletes || anyKeyPairDeletes
+	changed = changed || anyKeyPairDeleted
 
-	controllerutil.RemoveFinalizer(ingress, apiFinalizer)
+	changed = changed || controllerutil.RemoveFinalizer(ingress, apiFinalizer)
 
-	return anyDeletes, nil
+	return changed, nil
 }
 
 // SetGatewayConfig applies Gateway-defined configuration.
@@ -447,7 +444,7 @@ func (r *APIReconciler) SetGatewayConfig(
 	}
 	changes = changes || anyDeletes
 
-	changedKeyPair, err := r.upsertKeyPairs(ctx, gatewayConfig.Certificates)
+	changedKeyPair, err := r.syncSecrets(ctx, gatewayConfig.Certificates)
 	if err != nil {
 		return changes, err
 	}
@@ -473,12 +470,13 @@ func (r *APIReconciler) SetGatewayConfig(
 				}
 
 				k := routeIDAnnotationForIndex(i)
-				routeChanged, err := r.upsertOneRoute(ctx, gr.Annotations[k], route)
+				route.Id = emptyToNil(gr.Annotations[k])
+				routeChanged, err := r.upsertOneRoute(ctx, route)
 				if err != nil {
 					return changes, err
 				}
 				changes = changes || routeChanged
-				if gr.Annotations[k] == "" {
+				if gr.Annotations[k] != *route.Id {
 					setAnnotation(gr, k, *route.Id)
 				}
 			}
@@ -495,8 +493,6 @@ func (r *APIReconciler) SetGatewayConfig(
 		}
 
 		if err := r.k8sClient.Patch(ctx, gr.HTTPRoute, client.MergeFrom(originalRoute)); err != nil {
-			logger := log.FromContext(ctx).WithName("APIReconciler.SetGatewayConfig")
-			logger.Error(err, "couldn't patch httproute", "name", gr.Name)
 			return changes, err
 		}
 	}
@@ -556,8 +552,6 @@ func (r *APIReconciler) syncGatewayPolicies(
 		policyIDs[policy.GetSourcePpl()] = policy.GetId()
 
 		if err := r.k8sClient.Patch(ctx, obj, client.MergeFrom(originalObj)); err != nil {
-			logger := log.FromContext(ctx).WithName("APIReconciler.syncGatewayPolicies")
-			logger.Error(err, "couldn't patch policyfilter", "name", obj.Name)
 			return changes, nil, err
 		}
 	}
@@ -588,8 +582,6 @@ func (r *APIReconciler) removeDeletedGatewayPolicies(
 		originalObj := obj.DeepCopy()
 		controllerutil.RemoveFinalizer(obj, apiFinalizer)
 		if err := r.k8sClient.Patch(ctx, obj, client.MergeFrom(originalObj)); err != nil {
-			logger := log.FromContext(ctx).WithName("APIReconciler.removeDeletedGatewayPolicies")
-			logger.Error(err, "couldn't patch policyfilter", "name", obj.Name)
 			return changes, err
 		}
 	}
@@ -613,7 +605,7 @@ func replaceInlinePolicies(route *pb.Route, policyIDs map[string]string) error {
 	return nil
 }
 
-func (r *APIReconciler) upsertOneRoute(ctx context.Context, id string, route *pb.Route) (bool, error) {
+func (r *APIReconciler) upsertOneRoute(ctx context.Context, route *pb.Route) (bool, error) {
 	logger := log.FromContext(ctx).WithName("APIReconciler.upsertOneRoute")
 
 	apiRoute, err := convertProto[*pomerium.Route](route)
@@ -623,7 +615,7 @@ func (r *APIReconciler) upsertOneRoute(ctx context.Context, id string, route *pb
 	apiRoute.OriginatorId = &originatorID
 
 	var existing *pomerium.Route
-	if id != "" {
+	if id := route.GetId(); id != "" {
 		resp, err := r.apiClient.GetRoute(ctx, connect.NewRequest(&pomerium.GetRouteRequest{
 			Id: id,
 		}))
@@ -632,12 +624,6 @@ func (r *APIReconciler) upsertOneRoute(ctx context.Context, id string, route *pb
 		} else if err == nil {
 			existing = resp.Msg.Route
 		}
-
-		apiRoute.Id = new(id)
-	} else {
-		// The ID must be assigned during route creation. (We can't use the
-		// derived ID from the conversion logic.)
-		apiRoute.Id = nil
 	}
 
 	if existing == nil {
@@ -647,11 +633,21 @@ func (r *APIReconciler) upsertOneRoute(ctx context.Context, id string, route *pb
 		resp, err := r.apiClient.CreateRoute(ctx, connect.NewRequest(&pomerium.CreateRouteRequest{
 			Route: apiRoute,
 		}))
+		if err == nil {
+			route.Id = resp.Msg.Route.Id
+			return true, nil
+		} else if connect.CodeOf(err) != connect.CodeAlreadyExists {
+			return false, err
+		}
+
+		// If we already created a route, but failed to save the ID annotation,
+		// attempt to look up the route by name.
+		existing, err = r.findRouteByName(ctx, route.GetName())
 		if err != nil {
 			return false, err
 		}
-		route.Id = resp.Msg.Route.Id
-		return true, nil
+		apiRoute.Id = existing.Id
+		route.Id = existing.Id
 	}
 
 	// Clear the fields that should be ignored when looking for changes.
@@ -675,6 +671,27 @@ func (r *APIReconciler) upsertOneRoute(ctx context.Context, id string, route *pb
 		Route: apiRoute,
 	}))
 	return err == nil, err
+}
+
+func (r *APIReconciler) findRouteByName(
+	ctx context.Context, name string,
+) (existing *pomerium.Route, err error) {
+	filter, err := structpb.NewStruct(map[string]any{
+		"originatorId": originatorID,
+		"name":         name,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("internal error - couldn't create ListRoutes filter: %w", err)
+	}
+	resp, err := r.apiClient.ListRoutes(ctx, connect.NewRequest(&pomerium.ListRoutesRequest{
+		Filter: filter,
+	}))
+	if err != nil {
+		return nil, err
+	} else if len(resp.Msg.Routes) == 0 {
+		return nil, fmt.Errorf("could not find route by name")
+	}
+	return resp.Msg.Routes[0], nil
 }
 
 // deleteRoutes deletes routes corresponding to the keys in annotationKeys and
@@ -752,11 +769,21 @@ func (r *APIReconciler) upsertPolicy(ctx context.Context, policy *pomerium.Polic
 		resp, err := r.apiClient.CreatePolicy(ctx, connect.NewRequest(&pomerium.CreatePolicyRequest{
 			Policy: policy,
 		}))
+		if err == nil {
+			policy.Id = resp.Msg.Policy.Id
+			return true, nil
+		} else if connect.CodeOf(err) != connect.CodeAlreadyExists {
+			return false, err
+		}
+
+		// If we already created a policy, but failed to save the ID annotation,
+		// attempt to look up the policy by name.
+		existing, err = r.findPolicyByName(ctx, policy.GetName())
 		if err != nil {
 			return false, err
 		}
-		policy.Id = resp.Msg.Policy.Id
-		return true, nil
+		policy.Id = existing.Id
+		changed = true
 	}
 
 	// Zero out fields that should be ignored when looking for changes.
@@ -768,7 +795,7 @@ func (r *APIReconciler) upsertPolicy(ctx context.Context, policy *pomerium.Polic
 
 	if proto.Equal(existing, policy) {
 		// No changes needed.
-		return false, nil
+		return changed, nil
 	}
 
 	logger := log.FromContext(ctx).WithName("APIReconciler.upsertPolicy")
@@ -777,12 +804,36 @@ func (r *APIReconciler) upsertPolicy(ctx context.Context, policy *pomerium.Polic
 	_, err = r.apiClient.UpdatePolicy(ctx, connect.NewRequest(&pomerium.UpdatePolicyRequest{
 		Policy: policy,
 	}))
-	return err == nil, err
+	if err != nil {
+		return changed, err
+	}
+	return true, nil
 }
 
-// deletePolicy deletes the policy for the ingress and clears its policy ID
-// annotation. Returns true if any changes were made, or an error if the delete
-// operation failed.
+func (r *APIReconciler) findPolicyByName(
+	ctx context.Context, name string,
+) (existing *pomerium.Policy, err error) {
+	filter, err := structpb.NewStruct(map[string]any{
+		"originatorId": originatorID,
+		"name":         name,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("internal error - couldn't create ListPolicies filter: %w", err)
+	}
+	resp, err := r.apiClient.ListPolicies(ctx, connect.NewRequest(&pomerium.ListPoliciesRequest{
+		Filter: filter,
+	}))
+	if err != nil {
+		return nil, err
+	} else if len(resp.Msg.Policies) == 0 {
+		return nil, fmt.Errorf("could not find policy by name")
+	}
+	return resp.Msg.Policies[0], nil
+}
+
+// deletePolicy deletes the policy for obj and clears its policy ID annotation.
+// Returns true if any changes were made, or an error if the delete operation
+// failed.
 func (r *APIReconciler) deletePolicy(
 	ctx context.Context, obj client.Object,
 ) (deleted bool, err error) {
@@ -801,31 +852,42 @@ func (r *APIReconciler) deletePolicy(
 	return true, nil
 }
 
-func (r *APIReconciler) createKeyPair(ctx context.Context, keyPair *pomerium.KeyPair) (newID string, err error) {
-	resp, err := r.apiClient.CreateKeyPair(ctx, connect.NewRequest(&pomerium.CreateKeyPairRequest{
-		KeyPair: keyPair,
-	}))
-	if err != nil {
-		return "", err
-	}
-	return resp.Msg.GetKeyPair().GetId(), nil
-}
-
 func (r *APIReconciler) upsertKeyPair(ctx context.Context, keyPair *pomerium.KeyPair) (changed bool, err error) {
-	resp, err := r.apiClient.GetKeyPair(ctx, connect.NewRequest(&pomerium.GetKeyPairRequest{
-		Id: keyPair.GetId(),
-	}))
-	if err != nil {
-		if connect.CodeOf(err) == connect.CodeNotFound {
-			// If the existing key pair was deleted, recreate it.
-			_, err := r.createKeyPair(ctx, keyPair)
-			return err == nil, err
+	var existing *pomerium.KeyPair
+	if id := keyPair.GetId(); id != "" {
+		resp, err := r.apiClient.GetKeyPair(ctx, connect.NewRequest(&pomerium.GetKeyPairRequest{
+			Id: id,
+		}))
+		if err == nil {
+			existing = resp.Msg.KeyPair
+		} else if connect.CodeOf(err) != connect.CodeNotFound {
+			return false, err
 		}
-		return false, err
+	}
+
+	// If there is no existing keypair, create one.
+	if existing == nil {
+		resp, err := r.apiClient.CreateKeyPair(ctx, connect.NewRequest(&pomerium.CreateKeyPairRequest{
+			KeyPair: keyPair,
+		}))
+		if err == nil {
+			keyPair.Id = resp.Msg.KeyPair.Id
+			return true, nil
+		} else if connect.CodeOf(err) != connect.CodeAlreadyExists {
+			return false, err
+		}
+
+		// If we already created a keypair, but failed to save the ID annotation,
+		// attempt to look up the keypair by name.
+		existing, err = r.findKeyPairByName(ctx, keyPair.GetName())
+		if err != nil {
+			return false, err
+		}
+		keyPair.Id = existing.Id
+		changed = true
 	}
 
 	// Zero out fields that should be ignored when looking for changes.
-	existing := resp.Msg.KeyPair
 	existing.NamespaceId = nil
 	existing.CreatedAt = nil
 	existing.ModifiedAt = nil
@@ -835,7 +897,7 @@ func (r *APIReconciler) upsertKeyPair(ctx context.Context, keyPair *pomerium.Key
 
 	if proto.Equal(existing, keyPair) {
 		// No changes needed.
-		return false, nil
+		return changed, nil
 	}
 
 	logger := log.FromContext(ctx).WithName("APIReconciler.upsertKeyPair")
@@ -846,7 +908,31 @@ func (r *APIReconciler) upsertKeyPair(ctx context.Context, keyPair *pomerium.Key
 	_, err = r.apiClient.UpdateKeyPair(ctx, connect.NewRequest(&pomerium.UpdateKeyPairRequest{
 		KeyPair: keyPair,
 	}))
-	return err == nil, err
+	if err != nil {
+		return changed, err
+	}
+	return true, nil
+}
+
+func (r *APIReconciler) findKeyPairByName(
+	ctx context.Context, name string,
+) (existing *pomerium.KeyPair, err error) {
+	filter, err := structpb.NewStruct(map[string]any{
+		"originatorId": originatorID,
+		"name":         name,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("internal error - couldn't create ListKeyPairs filter: %w", err)
+	}
+	resp, err := r.apiClient.ListKeyPairs(ctx, connect.NewRequest(&pomerium.ListKeyPairsRequest{
+		Filter: filter,
+	}))
+	if err != nil {
+		return nil, err
+	} else if len(resp.Msg.KeyPairs) == 0 {
+		return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("could not find keypair by name"))
+	}
+	return resp.Msg.KeyPairs[0], nil
 }
 
 // deleteKeyPairs deletes the keypairs corresponding to the given Secret names,
@@ -855,36 +941,48 @@ func (r *APIReconciler) upsertKeyPair(ctx context.Context, keyPair *pomerium.Key
 func (r *APIReconciler) deleteKeyPairs(
 	ctx context.Context, secretNames ...types.NamespacedName,
 ) (bool, error) {
-	logger := log.FromContext(ctx).WithName("APIReconciler.deleteKeyPairs")
 	var anyDeletes bool
 	for _, n := range secretNames {
+		var keyPairID string
+
 		secret := new(corev1.Secret)
 		err := r.k8sClient.Get(ctx, n, secret)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				// If we can't retrieve this Secret, we won't know the ID of the
-				// keypair to delete. There's not much we can do in this case.
-				logger.Info("could not delete keypair (secret not found)", "secret", n)
-				continue
+				secret = nil
+			} else {
+				return anyDeletes, err
 			}
-			return anyDeletes, err
+		} else {
+			keyPairID = secret.Annotations[apiKeyPairIDAnnotation]
 		}
-		keyPairID := secret.Annotations[apiKeyPairIDAnnotation]
+
+		// If we don't have a keypair ID, try to look up the keypair by name.
 		if keyPairID == "" {
-			continue
+			keypair, err := r.findKeyPairByName(ctx, keyPairName(n))
+			if err != nil && connect.CodeOf(err) != connect.CodeNotFound {
+				return anyDeletes, err
+			} else if err == nil {
+				keyPairID = keypair.GetId()
+			}
 		}
-		_, err = r.apiClient.DeleteKeyPair(ctx, connect.NewRequest(&pomerium.DeleteKeyPairRequest{
-			Id: keyPairID,
-		}))
-		if err != nil && connect.CodeOf(err) != connect.CodeNotFound {
-			return anyDeletes, err
+
+		if keyPairID != "" {
+			_, err = r.apiClient.DeleteKeyPair(ctx, connect.NewRequest(&pomerium.DeleteKeyPairRequest{
+				Id: keyPairID,
+			}))
+			if err != nil && connect.CodeOf(err) != connect.CodeNotFound {
+				return anyDeletes, err
+			}
 		}
-		originalSecret := secret.DeepCopy()
-		delete(secret.Annotations, apiKeyPairIDAnnotation)
-		controllerutil.RemoveFinalizer(secret, apiFinalizer)
-		if err := r.k8sClient.Patch(ctx, secret, client.MergeFrom(originalSecret)); err != nil {
-			logger.Error(err, "couldn't patch secret", "name", secret.Name)
-			return anyDeletes, err
+
+		if secret != nil {
+			originalSecret := secret.DeepCopy()
+			delete(secret.Annotations, apiKeyPairIDAnnotation)
+			controllerutil.RemoveFinalizer(secret, apiFinalizer)
+			if err := r.k8sClient.Patch(ctx, secret, client.MergeFrom(originalSecret)); err != nil {
+				return anyDeletes, err
+			}
 		}
 		anyDeletes = true
 	}
@@ -931,4 +1029,11 @@ func falseToNil(x *bool) *bool {
 		return nil
 	}
 	return x
+}
+
+func emptyToNil(x string) *string {
+	if x == "" {
+		return nil
+	}
+	return new(x)
 }
